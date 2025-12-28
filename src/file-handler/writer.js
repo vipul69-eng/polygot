@@ -28,11 +28,23 @@ async function writeFile(filePath, content, options = {}) {
     throw new Error(`Failed to create directory ${dirPath}: ${error.message}`);
   }
 
-  // Convert object to JSON string if needed
-  const fileContent =
-    typeof content === "object"
-      ? JSON.stringify(content, null, indent)
-      : content;
+  let fileContent = content;
+
+  // If content is an object and file exists, merge with existing JSON
+  if (typeof content === "object") {
+    try {
+      const existingContent = await fs.readFile(filePath, encoding);
+      const existingJson = JSON.parse(existingContent);
+
+      // Merge existing JSON with new content
+      fileContent = { ...existingJson, ...content };
+    } catch (error) {
+      // File doesn't exist or isn't valid JSON, use new content as-is
+      fileContent = content;
+    }
+
+    fileContent = JSON.stringify(fileContent, null, indent);
+  }
 
   // Write file
   try {

@@ -12,14 +12,18 @@ const { writeFile } = require("../file-handler/writer");
  * @param {string[]} [visibleAttributes] - Optional visible attributes
  * @returns {Promise<string[]>} Array of extracted strings
  */
-async function parseFiles(filePath, visibleAttributes = undefined) {
+async function parseFiles(
+  filePath,
+  visibleAttributes = undefined,
+  excludeTags = []
+) {
   if (!filePath || typeof filePath !== "string") {
     throw new Error("filePath must be a non-empty string");
   }
 
   const normalized = path.normalize(filePath);
   const content = await readFile(normalized);
-  const extracted = polygotParser(content, visibleAttributes);
+  const extracted = polygotParser(content, visibleAttributes, excludeTags);
 
   return Array.from(new Set(extracted));
 }
@@ -31,7 +35,11 @@ async function parseFiles(filePath, visibleAttributes = undefined) {
  * @param {string[]} [visibleAttributes] - Optional visible attributes
  * @returns {Promise<string[]>} Array of extracted strings
  */
-async function parseDir(dirPath, visibleAttributes = undefined) {
+async function parseDir(
+  dirPath,
+  visibleAttributes = undefined,
+  excludeTags = []
+) {
   if (!dirPath || typeof dirPath !== "string") {
     throw new Error("dirPath must be a non-empty string");
   }
@@ -42,7 +50,7 @@ async function parseDir(dirPath, visibleAttributes = undefined) {
   for (const fp of filePaths) {
     try {
       const content = await readFile(fp);
-      const extracted = polygotParser(content, visibleAttributes);
+      const extracted = polygotParser(content, visibleAttributes, excludeTags);
       const uniqueExtracted = Array.from(new Set(extracted));
       uniqueExtracted.forEach((s) => mergedSet.add(s));
     } catch (err) {
@@ -76,7 +84,7 @@ async function parseAndExtract(
   outputDir,
   options = {}
 ) {
-  const { visibleAttributes, logProgress = true } = options;
+  const { visibleAttributes, excludeTags, logProgress = true } = options;
 
   if (logProgress) {
     console.log("\nStarting parse and extract workflow");
@@ -106,9 +114,17 @@ async function parseAndExtract(
     const stats = await fs.stat(sourcePath);
 
     if (stats.isDirectory()) {
-      extractedStrings = await parseDir(sourcePath, visibleAttributes);
+      extractedStrings = await parseDir(
+        sourcePath,
+        visibleAttributes,
+        excludeTags
+      );
     } else if (stats.isFile()) {
-      extractedStrings = await parseFiles(sourcePath, visibleAttributes);
+      extractedStrings = await parseFiles(
+        sourcePath,
+        visibleAttributes,
+        excludeTags
+      );
     } else {
       if (progressBar) progressBar.stop();
       throw new Error(`Invalid source path: ${sourcePath}`);

@@ -6,6 +6,7 @@ const { ora } = require("../utils/ora");
 const { parseAndExtract } = require("../workflow/parse-and-extract");
 const { parseAndTranslate } = require("../workflow/parse-and-translate");
 const packageJson = require("../../package.json");
+const { GlossaryManager } = require("../translation-memory");
 
 const program = new Command();
 
@@ -28,16 +29,27 @@ program
     "Comma-separated list of attributes to extract (e.g., title,placeholder,aria*)",
     "title,alt,placeholder"
   )
+  .option(
+    "-e, --exclude <tags>",
+    "Comma-separated list of tags/selectors to exclude (e.g., script,style,h1.container,div#header)",
+    ""
+  )
   .option("--no-progress", "Disable progress logging")
   .action(async (source, language, output, options) => {
     const spinner = ora("Extracting strings...").start();
 
     try {
       const attributes = options.attributes.split(",").map((a) => a.trim());
-
+      const excludeTags = options.exclude
+        ? options.exclude
+            .split(",")
+            .map((t) => t.trim())
+            .filter((t) => t.length > 0)
+        : [];
       const result = await parseAndExtract(source, language, output, {
         visibleAttributes: attributes,
         logProgress: options.progress,
+        excludeTags: excludeTags,
       });
 
       spinner.succeed(chalk.green("Extraction complete!"));
@@ -56,8 +68,10 @@ program
     }
   });
 
+// ... existing imports ...
+
 /**
- * Translate command
+ * Translate command - UPDATED
  */
 program
   .command("translate")
@@ -84,14 +98,29 @@ program
     "Comma-separated list of attributes to extract",
     "title,alt,placeholder,aria*"
   )
+  .option(
+    "-e, --exclude <tags>",
+    "Comma-separated list of tags/selectors to exclude",
+    ""
+  )
   .option("--chunk-size <size>", "Maximum strings per API call", "50")
   .option("--no-formatting", "Do not preserve placeholders/variables")
   .option("--no-progress", "Disable progress logging")
+  .option("--use-memory", "Use translation memory (default: true)", true)
+  .option("--no-memory", "Disable translation memory")
+  .option("--use-glossary", "Use glossary (default: true)", true)
+  .option("--no-glossary", "Disable glossary")
+  .option("--memory-path <path>", "Memory storage path", "./.polygot/memory")
+  .option(
+    "--glossary-path <path>",
+    "Glossary file path",
+    "./.polygot/glossary.json"
+  )
+  .option("--source-lang <lang>", "Source language code", "en")
   .action(async (source, languages, output, options) => {
     const spinner = ora("Starting translation...").start();
 
     try {
-      // Get API key
       const apiKey = options.apiKey || process.env.OPENAI_API_KEY;
 
       if (!apiKey) {
@@ -111,6 +140,12 @@ program
 
       const langArray = languages.split(",").map((l) => l.trim());
       const attributes = options.attributes.split(",").map((a) => a.trim());
+      const excludeTags = options.exclude
+        ? options.exclude
+            .split(",")
+            .map((t) => t.trim())
+            .filter((t) => t.length > 0)
+        : [];
 
       spinner.text = `Translating to ${langArray.length} language(s)...`;
 
@@ -127,6 +162,12 @@ program
           maxChunkSize: parseInt(options.chunkSize),
           preserveFormatting: options.formatting,
           logProgress: options.progress,
+          excludeTags: excludeTags,
+          useMemory: options.memory,
+          useGlossary: options.glossary,
+          memoryPath: options.memoryPath,
+          glossaryPath: options.glossaryPath,
+          sourceLang: options.sourceLang,
         }
       );
 
@@ -150,6 +191,31 @@ program
           result.tokensUsed.output
         })`
       );
+
+      if (result.optimizationStats) {
+        const savings = (
+          ((result.optimizationStats.fromMemory +
+            result.optimizationStats.fromGlossary) /
+            result.optimizationStats.totalStrings) *
+          100
+        ).toFixed(1);
+        console.log(chalk.cyan("\nCost Optimization:"));
+        console.log(
+          `  ${chalk.bold("Memory cache hits:")} ${
+            result.optimizationStats.fromMemory
+          }`
+        );
+        console.log(
+          `  ${chalk.bold("Glossary skips:")} ${
+            result.optimizationStats.fromGlossary
+          }`
+        );
+        console.log(
+          `  ${chalk.bold("API calls:")} ${result.optimizationStats.fromAPI}`
+        );
+        console.log(`  ${chalk.bold("API savings:")} ~${savings}%`);
+      }
+
       console.log(`  ${chalk.bold("Output directory:")} ${result.outputDir}`);
     } catch (error) {
       spinner.fail(chalk.red("Translation failed"));
@@ -161,9 +227,7 @@ program
     }
   });
 
-/**
- * Init command - Create example config
- */
+// Update init command to include memory and glossary settings
 program
   .command("init")
   .description("Initialize polygot configuration file")
@@ -183,11 +247,17 @@ program
       source: "./src",
       output: "./public/locales",
       languages: ["es", "fr", "de"],
+      sourceLang: "en",
       attributes: ["title", "alt", "placeholder", "aria*"],
+      excludeTags: ["script", "style"],
       model: "gpt-4o-mini",
       context: "Web application UI",
       tone: "neutral",
       chunkSize: 50,
+      useMemory: true,
+      useGlossary: true,
+      memoryPath: "./.polygot/memory",
+      glossaryPath: "./.polygot/glossary.json",
     };
 
     fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
@@ -195,12 +265,13 @@ program
     console.log(chalk.cyan("\nNext steps:"));
     console.log("  1. Edit polygot.config.json with your settings");
     console.log("  2. Set your API key: export OPENAI_API_KEY=your_key");
-    console.log("  3. Run: polygot translate-config");
+    console.log(
+      "  3. (Optional) Add glossary terms: polygot glossary add <term>"
+    );
+    console.log("  4. Run: polygot translate-config");
   });
 
-/**
- * Translate using config file
- */
+// Update translate-config to use memory and glossary
 program
   .command("translate-config")
   .description("Translate using polygot.config.json")
@@ -246,13 +317,23 @@ program
         apiKey,
         config.output,
         {
-          visibleAttributes: config.attributes,
-          model: config.model,
-          context: config.context,
-          tone: config.tone,
-          maxChunkSize: config.chunkSize,
+          visibleAttributes: config.attributes || [
+            "title",
+            "alt",
+            "placeholder",
+          ],
+          model: config.model || "gpt-4o-mini",
+          context: config.context || "",
+          tone: config.tone || "neutral",
+          maxChunkSize: config.chunkSize || 50,
           preserveFormatting: config.preserveFormatting !== false,
           logProgress: true,
+          excludeTags: config.excludeTags || [],
+          useMemory: config.useMemory !== false,
+          useGlossary: config.useGlossary !== false,
+          memoryPath: config.memoryPath || "./.polygot/memory",
+          glossaryPath: config.glossaryPath || "./.polygot/glossary.json",
+          sourceLang: config.sourceLang || "en",
         }
       );
 
@@ -269,6 +350,17 @@ program
       console.log(
         `  ${chalk.bold("Total tokens:")} ${result.tokensUsed.total}`
       );
+
+      if (result.optimizationStats) {
+        const savings = (
+          ((result.optimizationStats.fromMemory +
+            result.optimizationStats.fromGlossary) /
+            result.optimizationStats.totalStrings) *
+          100
+        ).toFixed(1);
+        console.log(chalk.cyan("\nOptimization:"));
+        console.log(`  API savings: ~${savings}%`);
+      }
     } catch (error) {
       spinner.fail(chalk.red("Translation failed"));
       console.error(chalk.red("\nError:"), error.message);
@@ -298,5 +390,268 @@ program
     );
   });
 
+program
+  .command("glossary")
+  .description("Add a term to the glossary")
+  .argument("<term>", 'Term to add (e.g., "OpenAI", "API", "Dashboard")')
+  .option(
+    "-t, --translations <json>",
+    'Translations as JSON object (e.g., \'{"es":"Hola","fr":"Bonjour"}\')'
+  )
+  .option(
+    "-c, --category <category>",
+    "Category: brand, technical, legal, ui, general",
+    "general"
+  )
+  .option("-d, --description <desc>", "Term description or notes")
+  .option("--no-translate", 'Mark term as "do not translate" (keep as-is)')
+  .option("--case-sensitive", "Enable case-sensitive matching", true)
+  .option("--no-case-sensitive", "Disable case-sensitive matching")
+  .option("--context <context>", "Context or usage notes")
+  .option("-p, --path <path>", "Glossary file path", "./.polygot/glossary.json")
+  .action(async (term, options) => {
+    try {
+      const glossary = new GlossaryManager(options.path);
+      await glossary.initialize();
+
+      let translations = {};
+      if (options.translations) {
+        try {
+          translations = JSON.parse(options.translations);
+        } catch (e) {
+          console.error(
+            chalk.red("Error: Invalid JSON format for translations")
+          );
+          console.log(
+            chalk.yellow('Example: \'{"es":"término","fr":"terme"}\'')
+          );
+          process.exit(1);
+        }
+      }
+
+      await glossary.add(term, translations, {
+        category: options.category,
+        description: options.description,
+        doNotTranslate: !options.translate,
+        caseSensitive: options.caseSensitive,
+        context: options.context,
+      });
+
+      console.log(chalk.green(`\n✓ Added term "${term}" to glossary`));
+      console.log(`  Category: ${options.category}`);
+
+      if (!options.translate) {
+        console.log(
+          chalk.yellow("  Mode: DO NOT TRANSLATE (will be kept as-is)")
+        );
+      } else if (Object.keys(translations).length > 0) {
+        console.log("  Translations:");
+        Object.entries(translations).forEach(([lang, trans]) => {
+          console.log(`    ${lang}: "${trans}"`);
+        });
+      } else {
+        console.log(chalk.gray("  No translations provided yet"));
+        console.log(
+          chalk.gray('  Use "polygot glossary update" to add translations')
+        );
+      }
+
+      if (options.description) {
+        console.log(`  Description: ${options.description}`);
+      }
+    } catch (error) {
+      console.error(chalk.red("Error:"), error.message);
+      process.exit(1);
+    }
+  });
+
+// List terms
+program
+  .command("glossary-list")
+  .description("List all glossary terms")
+  .option("-c, --category <category>", "Filter by category")
+  .option("--format <format>", "Output format: table, json, simple", "table")
+  .option("-p, --path <path>", "Glossary file path", "./.polygot/glossary.json")
+  .action(async (options) => {
+    try {
+      const glossary = new GlossaryManager(options.path);
+      await glossary.initialize();
+
+      const terms = options.category
+        ? glossary.getByCategory(options.category)
+        : Array.from(glossary.terms.values());
+
+      if (terms.length === 0) {
+        console.log(chalk.yellow("\nNo terms found in glossary."));
+        console.log(chalk.gray("\nAdd terms with:"));
+        console.log(chalk.gray('  polygot glossary add "YourTerm"'));
+        console.log(chalk.gray('  polygot glossary add "API" --no-translate'));
+        console.log(
+          chalk.gray('  polygot glossary add "Dashboard" -t \'{"es":"Panel"}\'')
+        );
+        return;
+      }
+
+      if (options.format === "json") {
+        console.log(JSON.stringify(terms, null, 2));
+        return;
+      }
+
+      console.log(chalk.cyan.bold("\nGlossary Terms:\n"));
+
+      if (options.format === "table") {
+        // Table format
+        terms.forEach((term, index) => {
+          console.log(
+            chalk.bold(`${index + 1}. ${term.term}`) +
+              chalk.gray(` [${term.category}]`)
+          );
+
+          if (term.description) {
+            console.log(`   ${chalk.gray(term.description)}`);
+          }
+
+          if (term.doNotTranslate) {
+            console.log(`   ${chalk.yellow("⚠ DO NOT TRANSLATE")}`);
+          } else if (Object.keys(term.translations).length > 0) {
+            const translationStr = Object.entries(term.translations)
+              .map(([lang, trans]) => `${lang}: "${trans}"`)
+              .join(", ");
+            console.log(`   Translations: ${translationStr}`);
+          } else {
+            console.log(chalk.gray("   No translations"));
+          }
+
+          if (term.context) {
+            console.log(chalk.gray(`   Context: ${term.context}`));
+          }
+
+          console.log("");
+        });
+      } else {
+        // Simple format
+        terms.forEach((term) => {
+          const flag = term.doNotTranslate ? chalk.yellow("[NO TRANS]") : "";
+          console.log(
+            `  ${term.term} ${flag} ${chalk.gray(`[${term.category}]`)}`
+          );
+        });
+      }
+
+      const stats = glossary.getStats();
+      console.log(chalk.gray(`Total: ${stats.total} terms`));
+    } catch (error) {
+      console.error(chalk.red("Error:"), error.message);
+      process.exit(1);
+    }
+  });
+
+// Update term
+program
+  .command("glossary-update")
+  .description("Update an existing term")
+  .argument("<term>", "Term to update")
+  .option(
+    "-t, --add-translation <json>",
+    'Add/update translations (e.g., \'{"es":"nuevo"}\')'
+  )
+  .option("-c, --category <category>", "Update category")
+  .option("-d, --description <desc>", "Update description")
+  .option("--translate", "Allow translation")
+  .option("--no-translate", "Mark as do not translate")
+  .option("--context <context>", "Update context")
+  .option("-p, --path <path>", "Glossary file path", "./.polygot/glossary.json")
+  .action(async (term, options) => {
+    try {
+      const glossary = new GlossaryManager(options.path);
+      await glossary.initialize();
+
+      const existing = glossary.get(term);
+      if (!existing) {
+        console.error(
+          chalk.red(`\nError: Term "${term}" not found in glossary`)
+        );
+        console.log(
+          chalk.gray('\nUse "polygot glossary list" to see all terms')
+        );
+        process.exit(1);
+      }
+
+      const updates = {};
+
+      if (options.addTranslation) {
+        try {
+          const newTranslations = JSON.parse(options.addTranslation);
+          updates.translations = {
+            ...existing.translations,
+            ...newTranslations,
+          };
+        } catch (e) {
+          console.error(chalk.red("Error: Invalid JSON format"));
+          process.exit(1);
+        }
+      }
+
+      if (options.category) updates.category = options.category;
+      if (options.description) updates.description = options.description;
+      if (options.context) updates.context = options.context;
+      if (options.translate !== undefined)
+        updates.doNotTranslate = !options.translate;
+
+      await glossary.update(term, updates);
+
+      console.log(chalk.green(`\n✓ Updated term "${term}"`));
+
+      if (updates.translations) {
+        console.log("  Updated translations:");
+        Object.entries(updates.translations).forEach(([lang, trans]) => {
+          console.log(`    ${lang}: "${trans}"`);
+        });
+      }
+    } catch (error) {
+      console.error(chalk.red("Error:"), error.message);
+      process.exit(1);
+    }
+  });
+
+// Remove term
+program
+  .command("glossary-remove")
+  .alias("delete")
+  .description("Remove a term from glossary")
+  .argument("<term>", "Term to remove")
+  .option("-p, --path <path>", "Glossary file path", "./.polygot/glossary.json")
+  .option("--confirm", "Skip confirmation prompt")
+  .action(async (term, options) => {
+    try {
+      const glossary = new GlossaryManager(options.path);
+      await glossary.initialize();
+
+      const existing = glossary.get(term);
+      if (!existing) {
+        console.error(chalk.red(`\nError: Term "${term}" not found`));
+        process.exit(1);
+      }
+
+      if (!options.confirm) {
+        console.log(
+          chalk.yellow(`\nAre you sure you want to remove "${term}"?`)
+        );
+        console.log(chalk.gray("Use --confirm flag to skip this prompt"));
+        console.log(
+          chalk.gray(
+            'Command: polygot glossary remove "' + term + '" --confirm'
+          )
+        );
+        return;
+      }
+
+      await glossary.delete(term);
+      console.log(chalk.green(`\n✓ Removed term "${term}" from glossary`));
+    } catch (error) {
+      console.error(chalk.red("Error:"), error.message);
+      process.exit(1);
+    }
+  });
 // Parse arguments
 program.parse();
