@@ -64,6 +64,7 @@ async function parseDir(
 /**
  * Parses UI files, extracts strings, and writes them to a source language JSON file
  * without translation. Useful for creating a base translation file or auditing extracted strings.
+ * Ignores strings that already exist in the output file.
  *
  * @param {string} sourcePath - Path to a single file or directory to scan
  * @param {string} sourceLanguageCode - Source language code (e.g., 'en')
@@ -103,11 +104,36 @@ async function parseAndExtract(
       barIncompleteChar: "\u2591",
       hideCursor: true,
     });
-    progressBar.start(3, 0);
+    progressBar.start(4, 0);
   }
 
-  // Step 1: Parse UI files to extract strings
+  // Step 1: Check for existing output file and load existing strings
   if (progressBar) progressBar.update(1);
+
+  const filePath = path.join(outputDir, `${sourceLanguageCode}.json`);
+  let existingStrings = new Set();
+
+  try {
+    const existingContent = await fs.readFile(filePath, "utf8");
+    const existingData = JSON.parse(existingContent);
+    existingStrings = new Set(Object.keys(existingData));
+
+    if (logProgress) {
+      console.log(
+        `Found ${existingStrings.size} existing strings in output file`
+      );
+    }
+  } catch (error) {
+    // File doesn't exist or can't be read - this is fine for first run
+    if (logProgress && error.code !== "ENOENT") {
+      console.log(
+        "No existing file found or unable to read it - will create new file"
+      );
+    }
+  }
+
+  // Step 2: Parse UI files to extract strings
+  if (progressBar) progressBar.update(2);
 
   let extractedStrings;
   try {
@@ -134,42 +160,72 @@ async function parseAndExtract(
     throw new Error(`Failed to parse source path: ${error.message}`);
   }
 
-  if (extractedStrings.length === 0) {
+  // Filter out existing strings
+  const newStrings = extractedStrings.filter(
+    (str) => !existingStrings.has(str)
+  );
+
+  if (logProgress) {
+    console.log(`\nTotal strings extracted: ${extractedStrings.length}`);
+    console.log(`New strings (not in existing file): ${newStrings.length}`);
+    console.log(
+      `Skipped (already exist): ${extractedStrings.length - newStrings.length}`
+    );
+  }
+
+  if (newStrings.length === 0) {
     if (progressBar) progressBar.stop();
-    console.warn("Warning: No strings found");
+    console.log("No new strings to add");
     return {
-      success: false,
-      message: "No strings extracted",
-      file: null,
+      success: true,
+      message: "No new strings found - all strings already exist",
+      file: filePath,
+      stringsExtracted: 0,
+      stringsSkipped: extractedStrings.length,
+      language: sourceLanguageCode,
+      outputDir: outputDir,
     };
   }
 
-  // Step 2: Create output object (original strings as both keys and values)
-  if (progressBar) progressBar.update(2);
+  // Step 3: Create output object (original strings as both keys and values)
+  if (progressBar) progressBar.update(3);
 
   const outputData = {};
-  extractedStrings.forEach((str) => {
+  newStrings.forEach((str) => {
     outputData[str] = str;
   });
 
-  // Step 3: Write file
-  const filePath = path.join(outputDir, `${sourceLanguageCode}.json`);
-
+  // Step 4: Merge with existing data and write file
   try {
-    await writeFile(filePath, outputData);
-    if (progressBar) progressBar.update(3);
+    // Load existing data again to merge
+    let finalData = {};
+    try {
+      const existingContent = await fs.readFile(filePath, "utf8");
+      finalData = JSON.parse(existingContent);
+    } catch (error) {
+      // File doesn't exist - start fresh
+    }
+
+    // Merge new strings with existing
+    Object.assign(finalData, outputData);
+
+    await writeFile(filePath, finalData);
+    if (progressBar) progressBar.update(4);
     if (progressBar) progressBar.stop();
 
     if (logProgress) {
       console.log(`\nExtraction complete!`);
-      console.log(`File created: ${filePath}`);
-      console.log(`Total strings: ${extractedStrings.length}`);
+      console.log(`File updated: ${filePath}`);
+      console.log(`New strings added: ${newStrings.length}`);
+      console.log(`Total strings in file: ${Object.keys(finalData).length}`);
     }
 
     return {
       success: true,
       file: filePath,
-      stringsExtracted: extractedStrings.length,
+      stringsExtracted: newStrings.length,
+      stringsSkipped: extractedStrings.length - newStrings.length,
+      totalStrings: Object.keys(finalData).length,
       language: sourceLanguageCode,
       outputDir: outputDir,
     };

@@ -5,10 +5,7 @@ const { polygotParser } = require("../parser");
 const { translateStrings } = require("../translator");
 const { readFile, readDir } = require("../file-handler/reader");
 const { writeFile } = require("../file-handler/writer");
-const {
-  GlossaryManager,
-  TranslationMemoryStore,
-} = require("../translation-memory");
+const { getCachedTranslations, updateGlobalStore } = require("../store");
 
 /**
  * Parse a single file for UI strings
@@ -59,138 +56,81 @@ async function parseDir(
 }
 
 /**
- * Translate strings with memory and glossary support
+ * Load existing translations from a language file
+ * @param {string} filePath - Path to the translation file
+ * @returns {Promise<Set>} Set of existing string keys
  */
-async function translateWithMemoryAndGlossary(
-  strings,
-  targetLang,
-  apiKey,
-  options = {}
-) {
-  const {
-    memory,
-    glossary,
-    sourceLang = "en",
-    ...translationOptions
-  } = options;
+async function loadExistingStrings(filePath) {
+  try {
+    const content = await fs.readFile(filePath, "utf8");
+    const data = JSON.parse(content);
+    return new Set(Object.keys(data));
+  } catch (error) {
+    // File doesn't exist or can't be read
+    return new Set();
+  }
+}
 
-  let stringsToTranslate = strings;
-  let finalTranslations = {};
-  let memoryHits = 0;
-  let glossarySkips = 0;
+/**
+ * Load existing translations data from a language file
+ * @param {string} filePath - Path to the translation file
+ * @returns {Promise<Object>} Existing translations object
+ */
+async function loadExistingTranslations(filePath) {
+  try {
+    const content = await fs.readFile(filePath, "utf8");
+    return JSON.parse(content);
+  } catch (error) {
+    // File doesn't exist or can't be read
+    return {};
+  }
+}
 
-  // Step 1: Check memory for cached translations
-  if (memory) {
-    const { found, missing } = await memory.batchGet(
-      strings,
-      sourceLang,
-      targetLang
-    );
-
-    memoryHits = found.size;
-    if (found.size > 0) {
-      console.log(`[Memory] Found ${found.size} cached translations`);
-      found.forEach((translation, original) => {
-        finalTranslations[original] = translation;
-      });
-    }
-
-    stringsToTranslate = missing;
+/**
+ * Filter strings based on glossary
+ * Strings in glossary should not be translated
+ * @param {string[]} strings - Array of strings to filter
+ * @param {string[]} glossary - Array of terms that should not be translated
+ * @returns {Object} Object with translatableStrings and glossaryStrings
+ */
+function filterGlossaryStrings(strings, glossary = []) {
+  if (!glossary || glossary.length === 0) {
+    return {
+      translatableStrings: strings,
+      glossaryStrings: [],
+    };
   }
 
-  // Step 2: Apply glossary filtering
-  let glossaryData = null;
-  if (glossary && stringsToTranslate.length > 0) {
-    glossaryData = glossary.prepareForTranslation(
-      stringsToTranslate,
-      targetLang
-    );
+  const glossarySet = new Set(glossary.map((term) => term.trim()));
+  const translatableStrings = [];
+  const glossaryStrings = [];
 
-    glossarySkips = glossaryData.skipTranslation.size;
-    if (glossaryData.skipTranslation.size > 0) {
-      console.log(
-        `[Glossary] ${glossaryData.skipTranslation.size} strings don't need API translation`
-      );
-      glossaryData.skipTranslation.forEach((translation, original) => {
-        finalTranslations[original] = translation;
-      });
+  for (const str of strings) {
+    if (glossarySet.has(str)) {
+      glossaryStrings.push(str);
+    } else {
+      translatableStrings.push(str);
     }
-
-    stringsToTranslate = glossaryData.stringsForAPI;
-  }
-
-  // Step 3: Translate remaining strings via API
-  let apiTranslations = {};
-  let tokensUsed = { input: 0, output: 0, total: 0, chunks: [] };
-
-  if (stringsToTranslate.length > 0) {
-    console.log(
-      `[API] Translating ${stringsToTranslate.length} strings via OpenAI`
-    );
-
-    const result = await translateStrings(
-      stringsToTranslate,
-      targetLang,
-      apiKey,
-      translationOptions
-    );
-
-    apiTranslations = result.translations;
-    tokensUsed = result.tokensUsed;
-
-    // Step 4: Post-process with glossary
-    if (glossary && glossaryData) {
-      apiTranslations = glossary.finalizeTranslations(
-        apiTranslations,
-        glossaryData.glossaryMap,
-        new Map(), // Already merged skipTranslation above
-        glossaryData.originalStrings
-      );
-    }
-
-    // Step 5: Store in memory for future use
-    if (memory) {
-      await memory.batchSet(apiTranslations, sourceLang, targetLang, {
-        model: translationOptions.model,
-        context: translationOptions.context,
-        tone: translationOptions.tone,
-      });
-      console.log(
-        `[Memory] Cached ${
-          Object.keys(apiTranslations).length
-        } new translations`
-      );
-    }
-
-    // Merge API translations
-    Object.assign(finalTranslations, apiTranslations);
   }
 
   return {
-    translations: finalTranslations,
-    tokensUsed,
-    stats: {
-      total: strings.length,
-      fromMemory: memoryHits,
-      fromGlossary: glossarySkips,
-      fromAPI: stringsToTranslate.length,
-      apiSavings: (
-        ((memoryHits + glossarySkips) / strings.length) *
-        100
-      ).toFixed(1),
-    },
+    translatableStrings,
+    glossaryStrings,
   };
 }
 
 /**
  * Parses UI files and translates extracted strings to specified language(s),
  * then writes the translations to JSON files in the output directory.
+ * Ignores strings that already exist in the output files for each language.
+ * Glossary terms are not translated and are kept as-is.
  *
  * @param {string} sourcePath - Path to a single file or directory to scan
  * @param {string|string[]} targetLanguages - Single language code or array of language codes
  * @param {string} apiKey - OpenAI API key
  * @param {string} outputDir - Output directory path
  * @param {Object} [options={}] - Optional configuration
+ * @param {string[]} [options.glossary] - Array of terms that should not be translated
  * @returns {Promise<Object>} Result object with file paths and metadata
  */
 async function parseAndTranslate(
@@ -204,12 +144,8 @@ async function parseAndTranslate(
     visibleAttributes,
     includeSourceStrings = false,
     logProgress = true,
-    excludeTags = [],
-    useMemory = true,
-    useGlossary = true,
-    memoryPath = "./.polygot/memory",
-    glossaryPath = "./.polygot/glossary.json",
-    sourceLang = "en",
+    excludeTags,
+    glossary = [],
     ...translationOptions
   } = options;
 
@@ -222,22 +158,11 @@ async function parseAndTranslate(
     console.log(`Source: ${sourcePath}`);
     console.log(`Target languages: ${languages.join(", ")}`);
     console.log(`Output directory: ${outputDir}`);
-    console.log(`Memory: ${useMemory ? "ENABLED" : "DISABLED"}`);
-    console.log(`Glossary: ${useGlossary ? "ENABLED" : "DISABLED"}`);
-  }
-
-  // Initialize memory and glossary
-  let memory = null;
-  let glossary = null;
-
-  if (useMemory) {
-    memory = new TranslationMemoryStore(memoryPath);
-    await memory.initialize();
-  }
-
-  if (useGlossary) {
-    glossary = new GlossaryManager(glossaryPath);
-    await glossary.initialize();
+    if (glossary && glossary.length > 0) {
+      console.log(
+        `Glossary terms: ${glossary.length} (will not be translated)`
+      );
+    }
   }
 
   // Step 1: Extract strings
@@ -281,16 +206,90 @@ async function parseAndTranslate(
     console.log(`Extracted ${extractedStrings.length} unique strings`);
   }
 
-  // Step 2: Translate
+  // Step 1.5: Filter glossary terms
+  const { translatableStrings, glossaryStrings } = filterGlossaryStrings(
+    extractedStrings,
+    glossary
+  );
+
+  if (logProgress && glossaryStrings.length > 0) {
+    console.log(
+      `Found ${glossaryStrings.length} glossary terms (will not be translated)`
+    );
+    console.log(`Strings to translate: ${translatableStrings.length}`);
+  }
+
+  // Step 2: Check existing translations for each language
   if (logProgress) {
-    console.log("\nStep 2: Translating strings...");
+    console.log("\nStep 2: Checking for existing translations...");
+  }
+
+  const languageStringsMap = {};
+  const existingTranslationsMap = {};
+  let totalSkipped = 0;
+  let totalGlossaryTerms = 0;
+
+  for (const lang of languages) {
+    const filePath = path.join(outputDir, `${lang}.json`);
+    const existingStrings = await loadExistingStrings(filePath);
+    const existingTranslations = await loadExistingTranslations(filePath);
+
+    // Filter out strings that already exist for this language
+    const newStrings = translatableStrings.filter(
+      (str) => !existingStrings.has(str)
+    );
+    const skipped = translatableStrings.length - newStrings.length;
+
+    languageStringsMap[lang] = newStrings;
+    existingTranslationsMap[lang] = existingTranslations;
+    totalSkipped += skipped;
+    totalGlossaryTerms += glossaryStrings.length;
+
+    if (logProgress && existingStrings.size > 0) {
+      console.log(
+        `  ${lang}: ${existingStrings.size} existing, ${newStrings.length} new, ${skipped} skipped, ${glossaryStrings.length} glossary`
+      );
+    } else if (logProgress) {
+      console.log(
+        `  ${lang}: ${newStrings.length} new, ${glossaryStrings.length} glossary`
+      );
+    }
+  }
+
+  // Check if there are any new strings to translate
+  const hasNewStrings = Object.values(languageStringsMap).some(
+    (strings) => strings.length > 0
+  );
+
+  if (!hasNewStrings && glossaryStrings.length === 0) {
+    if (logProgress) {
+      console.log(
+        "\nNo new strings to translate - all strings already exist in all target languages"
+      );
+    }
+    return {
+      success: true,
+      message: "No new strings to translate",
+      files: languages.map((lang) => path.join(outputDir, `${lang}.json`)),
+      stringsExtracted: extractedStrings.length,
+      stringsSkipped: extractedStrings.length,
+      glossaryTerms: 0,
+      languages: languages,
+      tokensUsed: { input: 0, output: 0, total: 0 },
+      outputDir: outputDir,
+    };
+  }
+
+  // Step 3: Translate
+  if (logProgress) {
+    console.log("\nStep 3: Translating strings...");
   }
 
   let progressBar;
   if (logProgress) {
     progressBar = new cliProgress.SingleBar({
       format:
-        "Translation Progress |{bar}| {percentage}% | {value}/{total} Languages | ETA: {eta}s",
+        "Translation Progress |{bar}| {percentage}% | {value}/{total} Languages",
       barCompleteChar: "\u2588",
       barIncompleteChar: "\u2591",
       hideCursor: true,
@@ -300,39 +299,41 @@ async function parseAndTranslate(
 
   let translationResults = {};
   const totalTokens = { input: 0, output: 0, total: 0 };
-  const aggregateStats = {
-    totalStrings: extractedStrings.length,
-    fromMemory: 0,
-    fromGlossary: 0,
-    fromAPI: 0,
-  };
 
   try {
     for (let i = 0; i < languages.length; i++) {
       const lang = languages[i];
-
-      const result = await translateWithMemoryAndGlossary(
-        extractedStrings,
+      const { cached, missing } = getCachedTranslations(
         lang,
-        apiKey,
-        {
-          ...translationOptions,
-          memory,
-          glossary,
-          sourceLang,
-          logProgress: false,
-        }
+        languageStringsMap[lang]
       );
+      if (missing.length === 0) {
+        translationResults[lang] = {
+          translations: cached,
+          tokensUsed: { input: 0, output: 0, total: 0 },
+        };
+      } else {
+        const result = await translateStrings(missing, lang, apiKey, {
+          ...translationOptions,
+          logProgress: false,
+        });
 
-      translationResults[lang] = result;
+        // Merge cached + new
+        translationResults[lang] = {
+          translations: {
+            ...cached,
+            ...result.translations,
+          },
+          tokensUsed: result.tokensUsed,
+        };
 
-      totalTokens.input += result.tokensUsed.input;
-      totalTokens.output += result.tokensUsed.output;
-      totalTokens.total += result.tokensUsed.total;
+        // 🔥 Save new translations globally
+        updateGlobalStore(lang, result.translations);
 
-      aggregateStats.fromMemory += result.stats.fromMemory;
-      aggregateStats.fromGlossary += result.stats.fromGlossary;
-      aggregateStats.fromAPI += result.stats.fromAPI;
+        totalTokens.input += result.tokensUsed.input;
+        totalTokens.output += result.tokensUsed.output;
+        totalTokens.total += result.tokensUsed.total;
+      }
 
       if (progressBar) {
         progressBar.update(i + 1);
@@ -345,31 +346,39 @@ async function parseAndTranslate(
     if (progressBar) progressBar.stop();
   }
 
-  // Save memory if used
-  if (memory) {
-    await memory.save();
-  }
-
-  // Step 3: Write files
+  // Step 4: Write files (merge with existing translations and add glossary terms)
   if (logProgress) {
-    console.log("\nStep 3: Writing translation files...");
+    console.log("\nStep 4: Writing translation files...");
   }
 
   const writtenFiles = [];
 
   for (const [langCode, result] of Object.entries(translationResults)) {
     const filePath = path.join(outputDir, `${langCode}.json`);
-    const outputData = result.translations;
+
+    // Create glossary entries (keep original string as value)
+    const glossaryEntries = {};
+    glossaryStrings.forEach((term) => {
+      glossaryEntries[term] = term;
+    });
+
+    // Merge: existing translations + new translations + glossary terms
+    const mergedTranslations = {
+      ...existingTranslationsMap[langCode],
+      ...result.translations,
+      ...glossaryEntries,
+    };
 
     try {
-      await writeFile(filePath, outputData);
+      await writeFile(filePath, mergedTranslations);
       writtenFiles.push(filePath);
 
       if (logProgress) {
+        const newCount = Object.keys(result.translations).length;
+        const glossaryCount = glossaryStrings.length;
+        const totalCount = Object.keys(mergedTranslations).length;
         console.log(
-          `  Written ${langCode}.json (${
-            Object.keys(outputData).length
-          } translations)`
+          `  Written ${langCode}.json (${newCount} translated, ${glossaryCount} glossary, ${totalCount} total)`
         );
       }
     } catch (error) {
@@ -379,46 +388,28 @@ async function parseAndTranslate(
 
   if (logProgress) {
     console.log("\nTranslation workflow complete!");
+    console.log(`Total strings extracted: ${extractedStrings.length}`);
+    console.log(`Glossary terms (not translated): ${glossaryStrings.length}`);
+    console.log(`Strings translated: ${translatableStrings.length}`);
+    console.log(
+      `Total strings skipped (already exist): ${
+        totalSkipped / languages.length
+      }`
+    );
     console.log(`Total tokens used: ${totalTokens.total}`);
-
-    if (useMemory || useGlossary) {
-      const avgSavings =
-        aggregateStats.totalStrings > 0
-          ? (
-              ((aggregateStats.fromMemory + aggregateStats.fromGlossary) /
-                aggregateStats.totalStrings) *
-              100
-            ).toFixed(1)
-          : 0;
-
-      console.log("\nCost Optimization:");
-      console.log(
-        `  From memory cache: ${aggregateStats.fromMemory} translations`
-      );
-      console.log(
-        `  From glossary: ${aggregateStats.fromGlossary} translations`
-      );
-      console.log(`  From API: ${aggregateStats.fromAPI} translations`);
-      console.log(`  API savings: ~${avgSavings}%`);
-    }
-
-    console.log(`\nFiles created: ${writtenFiles.length}`);
+    console.log(`Files created/updated: ${writtenFiles.length}`);
     writtenFiles.forEach((file) => console.log(`  - ${file}`));
   }
-
-  // Get memory stats if available
-  const memoryStats = memory ? memory.getStats() : null;
-  const glossaryStats = glossary ? glossary.getStats() : null;
 
   return {
     success: true,
     files: writtenFiles,
     stringsExtracted: extractedStrings.length,
+    stringsTranslated: translatableStrings.length,
+    stringsSkipped: totalSkipped / languages.length,
+    glossaryTerms: glossaryStrings.length,
     languages: languages,
     tokensUsed: totalTokens,
-    optimizationStats: aggregateStats,
-    memoryStats,
-    glossaryStats,
     outputDir: outputDir,
   };
 }

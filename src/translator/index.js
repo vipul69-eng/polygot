@@ -8,6 +8,7 @@ const {
 
 module.exports = {
   translateStrings,
+  batchTranslateStrings,
   SUPPORTED_LANGUAGES,
   isLanguageSupported,
   getLanguageName,

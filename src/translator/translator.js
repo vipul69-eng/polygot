@@ -3,7 +3,6 @@ const { SUPPORTED_LANGUAGES } = require("./languages");
 
 /**
  * Translates an array of strings to a target language using OpenAI API
- * Now supports glossary filtering to reduce token usage
  *
  * @param {string[]} strings - Array of strings to translate
  * @param {string} targetLanguage - Target language code
@@ -19,8 +18,6 @@ async function translateStrings(strings, targetLanguage, apiKey, options = {}) {
     maxChunkSize = 50,
     preserveFormatting = true,
     logProgress = true,
-    glossary = null, // GlossaryManager instance
-    sourceLang = "en",
   } = options;
 
   // Validate target language
@@ -32,6 +29,7 @@ async function translateStrings(strings, targetLanguage, apiKey, options = {}) {
     );
   }
 
+  // Validate inputs
   if (!Array.isArray(strings) || strings.length === 0) {
     throw new Error("Strings must be a non-empty array");
   }
@@ -48,72 +46,16 @@ async function translateStrings(strings, targetLanguage, apiKey, options = {}) {
 
   if (logProgress) {
     console.log(
-      `Starting translation to ${SUPPORTED_LANGUAGES[targetLanguage]}`
+      `\nStarting translation to ${SUPPORTED_LANGUAGES[targetLanguage]}`
     );
     console.log(`Total unique strings: ${uniqueStrings.length}`);
     console.log(`Model: ${model}`);
   }
 
-  // Apply glossary filtering if provided
-  let stringsToTranslate = uniqueStrings;
-  let glossaryData = null;
-  const allTranslations = {};
-
-  if (glossary) {
-    if (logProgress) {
-      console.log("Applying glossary filtering...");
-    }
-
-    glossaryData = glossary.prepareForTranslation(
-      uniqueStrings,
-      targetLanguage
-    );
-
-    // Add skipped translations directly to final result
-    glossaryData.skipTranslation.forEach((translation, original) => {
-      allTranslations[original] = translation;
-    });
-
-    if (logProgress) {
-      console.log(
-        `Glossary filtered: ${glossaryData.skipTranslation.size} strings don't need API`
-      );
-      console.log(
-        `Glossary placeholders: ${glossaryData.glossaryMap.size} terms to protect`
-      );
-    }
-
-    stringsToTranslate = glossaryData.stringsForAPI;
-  }
-
-  // If all strings were handled by glossary, return early
-  if (stringsToTranslate.length === 0) {
-    if (logProgress) {
-      console.log("All strings handled by glossary - no API calls needed!");
-    }
-
-    return {
-      translations: allTranslations,
-      tokensUsed: { input: 0, output: 0, total: 0, chunks: [] },
-      language: {
-        code: targetLanguage,
-        name: SUPPORTED_LANGUAGES[targetLanguage],
-      },
-      metadata: {
-        totalStrings: uniqueStrings.length,
-        fromGlossary: uniqueStrings.length,
-        fromAPI: 0,
-        chunks: 0,
-        model: model,
-        timestamp: new Date().toISOString(),
-      },
-    };
-  }
-
   // Split strings into chunks
   const chunks = [];
-  for (let i = 0; i < stringsToTranslate.length; i += maxChunkSize) {
-    chunks.push(stringsToTranslate.slice(i, i + maxChunkSize));
+  for (let i = 0; i < uniqueStrings.length; i += maxChunkSize) {
+    chunks.push(uniqueStrings.slice(i, i + maxChunkSize));
   }
 
   if (logProgress && chunks.length > 1) {
@@ -130,20 +72,23 @@ async function translateStrings(strings, targetLanguage, apiKey, options = {}) {
     chunks: [],
   };
 
+  // Store all translations
+  const allTranslations = {};
+
   // Process each chunk
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
 
     if (logProgress) {
       console.log(
-        `Processing chunk ${i + 1}/${chunks.length} (${
+        `\nProcessing chunk ${i + 1}/${chunks.length} (${
           chunk.length
         } strings)...`
       );
     }
 
     try {
-      // Build system prompt
+      // Build the system prompt
       let systemPrompt = `You are a professional translator. Translate the following strings to ${SUPPORTED_LANGUAGES[targetLanguage]}.
 
 Requirements:
@@ -152,7 +97,7 @@ Requirements:
 - Return ONLY a JSON object where keys are original strings and values are translations`;
 
       if (preserveFormatting) {
-        systemPrompt += `\n- Preserve all placeholders, variables, and special formatting (e.g., {name}, \${variable}, %s, __GLOSSARY_N__)`;
+        systemPrompt += `\n- Preserve all placeholders, variables, and special formatting (e.g., {name}, \${variable}, %s, etc.)`;
       }
 
       if (tone !== "neutral") {
@@ -212,37 +157,14 @@ Requirements:
       });
     }
 
-    // Delay between chunks
+    // Add delay between chunks
     if (i < chunks.length - 1) {
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
   }
 
-  // Post-process with glossary if used
-  if (glossary && glossaryData) {
-    if (logProgress) {
-      console.log("Restoring glossary terms in translations...");
-    }
-
-    // Only process the API translations, not the ones we skipped
-    const apiTranslations = {};
-    Object.keys(allTranslations).forEach((key) => {
-      if (!glossaryData.skipTranslation.has(key)) {
-        apiTranslations[key] = allTranslations[key];
-      }
-    });
-
-    const processed = glossary.postprocessTranslations(
-      apiTranslations,
-      glossaryData.glossaryMap
-    );
-
-    // Merge back
-    Object.assign(allTranslations, processed);
-  }
-
   if (logProgress) {
-    console.log("Translation complete!");
+    console.log(`\nTranslation complete!`);
     console.log(
       `Total tokens used: ${tokenUsage.total} (${tokenUsage.input} input + ${tokenUsage.output} output)`
     );
@@ -257,8 +179,6 @@ Requirements:
     },
     metadata: {
       totalStrings: uniqueStrings.length,
-      fromGlossary: glossaryData ? glossaryData.skipTranslation.size : 0,
-      fromAPI: stringsToTranslate.length,
       chunks: chunks.length,
       model: model,
       timestamp: new Date().toISOString(),
@@ -266,7 +186,48 @@ Requirements:
   };
 }
 
+/**
+ * Batch translates strings to multiple languages
+ *
+ * @param {string[]} strings - Array of strings to translate
+ * @param {string[]} targetLanguages - Array of target language codes
+ * @param {string} apiKey - OpenAI API key
+ * @param {Object} [options={}] - Translation options
+ * @returns {Promise<Object>} Results for all languages
+ */
+async function batchTranslateStrings(
+  strings,
+  targetLanguages,
+  apiKey,
+  options = {}
+) {
+  const results = {};
+  const totalTokens = { input: 0, output: 0, total: 0 };
+
+  console.log(
+    `\nStarting batch translation to ${targetLanguages.length} languages`
+  );
+
+  for (const language of targetLanguages) {
+    const result = await translateStrings(strings, language, apiKey, {
+      ...options,
+      logProgress: false,
+    });
+    results[language] = result;
+
+    totalTokens.input += result.tokensUsed.input;
+    totalTokens.output += result.tokensUsed.output;
+    totalTokens.total += result.tokensUsed.total;
+  }
+
+  return {
+    results,
+    totalTokens,
+    languages: targetLanguages,
+  };
+}
+
 module.exports = {
   translateStrings,
-  SUPPORTED_LANGUAGES,
+  batchTranslateStrings,
 };
